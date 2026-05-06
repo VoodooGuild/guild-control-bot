@@ -19,7 +19,7 @@ class AddRenterModal(discord.ui.Modal, title="Add Renter"):
     )
     weekly_fee = discord.ui.TextInput(
         label="Weekly Fee",
-        placeholder="Ex: 100",
+        placeholder="Ex: 5000000",
         required=True,
         max_length=20
     )
@@ -40,6 +40,7 @@ class AddRenterModal(discord.ui.Modal, title="Add Renter"):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
+        # 1. Validação do dia da semana
         try:
             due_day_int = int(self.due_day.value)
             if not 1 <= due_day_int <= 7:
@@ -49,16 +50,22 @@ class AddRenterModal(discord.ui.Modal, title="Add Renter"):
             await interaction.followup.send("❌ Due day must be a number.", ephemeral=True)
             return
 
+        # Conversão de Número (1-7) para Texto (Monday-Sunday) igual ao Painel Web
+        days_map = {1: "Monday", 2: "Tuesday", 3: "Wednesday", 4: "Thursday", 5: "Friday", 6: "Saturday", 7: "Sunday"}
+        due_day_str = days_map[due_day_int]
+
+        # 2. Validação da taxa semanal (Prata não tem centavos, usar int)
         try:
-            weekly_fee_float = float(self.weekly_fee.value)
+            weekly_fee_int = int(self.weekly_fee.value)
         except ValueError:
-            await interaction.followup.send("❌ Weekly fee must be a number.", ephemeral=True)
+            await interaction.followup.send("❌ Weekly fee must be a whole number (no decimals).", ephemeral=True)
             return
 
+        # 3. Montando os dados para o Supabase
         data = {
             "ingame_name": self.ingame_name.value,
-            "weekly_fee": weekly_fee_float,
-            "due_day": due_day_int,
+            "weekly_fee": weekly_fee_int,
+            "due_day": due_day_str,
             "is_active": True,
             "notes": self.notes.value if self.notes.value else None,
             "created_at": datetime.utcnow().isoformat(),
@@ -68,24 +75,29 @@ class AddRenterModal(discord.ui.Modal, title="Add Renter"):
         if self.discord_id.value:
             data["discord_id"] = self.discord_id.value
 
-        result = supabase.table("renters").insert(data).execute()
-
-        if result.data:
+        # 4. Inserindo no Banco COM tratamento de erro (Proteção contra crashes)
+        try:
+            result = supabase.table("renters").insert(data).execute()
+            
+            # Se deu certo, monta o Embed
             embed = discord.Embed(
                 title="✅ Renter Added!",
                 color=discord.Color.green()
             )
             embed.add_field(name="In-Game Name", value=self.ingame_name.value, inline=True)
-            embed.add_field(name="Weekly Fee", value=f"{weekly_fee_float}", inline=True)
-            embed.add_field(name="Due Day", value=str(due_day_int), inline=True)
+            embed.add_field(name="Weekly Fee", value=f"{weekly_fee_int:,}", inline=True)
+            embed.add_field(name="Due Day", value=due_day_str, inline=True)
             if self.discord_id.value:
                 embed.add_field(name="Discord ID", value=self.discord_id.value, inline=True)
             if self.notes.value:
                 embed.add_field(name="Notes", value=self.notes.value, inline=False)
             embed.set_footer(text=f"Added by {interaction.user.display_name}")
+            
             await interaction.followup.send(embed=embed, ephemeral=False)
-        else:
-            await interaction.followup.send("❌ Error saving to database. Please try again.", ephemeral=True)
+
+        except Exception as e:
+            # Se o Supabase recusar, o bot não morre em silêncio. Ele te avisa o porquê!
+            await interaction.followup.send(f"❌ Erro do Supabase: `{str(e)}`", ephemeral=True)
 
 
 class Renters(commands.Cog):
@@ -102,32 +114,36 @@ class Renters(commands.Cog):
     async def list_renters(self, interaction: discord.Interaction):
         await interaction.response.defer()
 
-        result = supabase.table("renters").select("*").eq("is_active", True).order("ingame_name").execute()
+        try:
+            result = supabase.table("renters").select("*").eq("is_active", True).order("ingame_name").execute()
 
-        if not result.data:
-            await interaction.followup.send("📭 No active renters found.")
-            return
+            if not result.data:
+                await interaction.followup.send("📭 No active renters found.")
+                return
 
-        embed = discord.Embed(
-            title="📋 Active Renters",
-            color=discord.Color.blue(),
-            description=f"Total: **{len(result.data)}** renters"
-        )
-
-        days = {1: "Monday", 2: "Tuesday", 3: "Wednesday", 4: "Thursday", 5: "Friday", 6: "Saturday", 7: "Sunday"}
-
-        for renter in result.data[:25]:
-            day_name = days.get(renter.get("due_day"), str(renter.get("due_day")))
-            value = f"💰 Fee: {renter.get('weekly_fee')} | 📅 Due: {day_name}"
-            if renter.get("notes"):
-                value += f"\n📝 {renter.get('notes')}"
-            embed.add_field(
-                name=renter.get("ingame_name", "Unknown"),
-                value=value,
-                inline=False
+            embed = discord.Embed(
+                title="📋 Active Renters",
+                color=discord.Color.blue(),
+                description=f"Total: **{len(result.data)}** renters"
             )
 
-        await interaction.followup.send(embed=embed)
+            for renter in result.data[:25]:
+                # Como já salvamos o dia em string no add_renter, podemos pegar direto
+                day_name = renter.get("due_day", "Unknown")
+                fee = renter.get('weekly_fee')
+                value = f"💰 Fee: {fee:,} | 📅 Due: {day_name}" if fee is not None else f"📅 Due: {day_name}"
+                
+                if renter.get("notes"):
+                    value += f"\n📝 {renter.get('notes')}"
+                embed.add_field(
+                    name=renter.get("ingame_name", "Unknown"),
+                    value=value,
+                    inline=False
+                )
+
+            await interaction.followup.send(embed=embed)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Erro ao listar renters: `{str(e)}`")
 
     @app_commands.command(name="remove-renter", description="Deactivate a renter by in-game name")
     @app_commands.checks.has_permissions(administrator=True)
@@ -135,15 +151,18 @@ class Renters(commands.Cog):
     async def remove_renter(self, interaction: discord.Interaction, ingame_name: str):
         await interaction.response.defer()
 
-        result = supabase.table("renters")\
-            .update({"is_active": False, "updated_at": datetime.utcnow().isoformat()})\
-            .eq("ingame_name", ingame_name)\
-            .execute()
+        try:
+            result = supabase.table("renters")\
+                .update({"is_active": False, "updated_at": datetime.utcnow().isoformat()})\
+                .eq("ingame_name", ingame_name)\
+                .execute()
 
-        if result.data:
-            await interaction.followup.send(f"✅ Renter **{ingame_name}** has been deactivated.")
-        else:
-            await interaction.followup.send(f"❌ Renter **{ingame_name}** not found.")
+            if result.data:
+                await interaction.followup.send(f"✅ Renter **{ingame_name}** has been deactivated.")
+            else:
+                await interaction.followup.send(f"❌ Renter **{ingame_name}** not found.")
+        except Exception as e:
+            await interaction.followup.send(f"❌ Erro ao remover renter: `{str(e)}`")
 
     @add_renter.error
     @list_renters.error
